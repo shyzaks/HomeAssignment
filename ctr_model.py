@@ -22,9 +22,14 @@ numeric_columns = ['position', 'gig_price', 'gig_avg_rating', 'gig_rated_orders'
        'avg_position_shown_last_60d', 'previous_order_amount']
 dates_columns = ['created_at', 'user_reg_date', 'previous_order_date']
 binary_columns = ['is_click', 'is_filtered', 'is_user_buyer','is_seller_onlie']
-categorical_columns = list(set(full_df.columns) - set(numeric_columns) - set(dates_columns) - set(binary_columns))
+# categorical_columns = list(set(full_df.columns) - set(numeric_columns) - set(dates_columns) - set(binary_columns))
+categorical_columns = list(set(full_df.columns) - set(numeric_columns) - set(dates_columns) - set(binary_columns)-set([col for col in full_df.columns if '_id' in col]+['search_query']))
 
+full_df['user_timezone'].fillna('unknown', inplace=True)
 full_df['continent'] = full_df['user_timezone'].apply(lambda x: x.split('/')[0].lower())
+
+categorical_columns.append('continent')
+
 vc = full_df.continent.value_counts()
 vc.plot(kind='bar')
 
@@ -48,6 +53,9 @@ for i, col in enumerate(binary_columns):
     ser.plot(kind='pie', autopct='%1.1f%%', title=col, ylabel='', ax=axs[i])
 plt.show();
 
+def is_weekend(row):
+    return row['day'] in ['sat', 'sun']
+
 def add_time_features(df):
     df['created_at'] = pd.to_datetime(df['created_at'])
     df['user_reg_date'] = pd.to_datetime(df['user_reg_date'])
@@ -57,8 +65,14 @@ def add_time_features(df):
     df['day'] = df.created_at.dt.day_name().apply(lambda x: x.lower()[:3])
     df['week_in_month'] = df.created_at.dt.day // 7
     df['months_since_reg'] = ((df.created_at - df.user_reg_date).dt.days / 30.2).round(1)
-    df['hour_diff_from_last_purchase'] = (df.created_at.dt.hour - df.previous_order_date.dt.hour).round(1)
+
+    # df['hour_diff_from_last_purchase'] = (df.created_at.dt.hour - df.previous_order_date.dt.hour).round(1)
+    df['hour_diff_from_last_purchase'] = (df.created_at - df.previous_order_date).dt.seconds / 3600
+    df['hour_diff_from_last_purchase'].fillna(df['hour_diff_from_last_purchase'].mean(), inplace=True)
+
     df['days_since_last_purchase'] = (df.created_at - df.previous_order_date).dt.days
+    df['days_since_last_purchase'].fillna(df['days_since_last_purchase'].mean(), inplace=True)
+
     df['is_weekend'] = df.apply(is_weekend, axis=1)
     df = df.drop(['created_at','previous_order_date','user_reg_date'], axis=1)
     return df
@@ -75,8 +89,8 @@ for col in categorical_columns:
     full_df[col].fillna('other', inplace=True)
 
 for col in numeric_columns:
-    full_df[col].fillna(0, inplace=True)
-
+    # full_df[col].fillna(0, inplace=True)
+    full_df[col].fillna(full_df[col].mean(), inplace=True)
 def compare_sc_id(row):
     if pd.notna(row['gig_sc_id']) and pd.notna(row['previous_order_sc_id']):
         return int(row['gig_sc_id'] == row['previous_order_sc_id'])
@@ -93,12 +107,28 @@ def add_gig_features(df):
 
 full_df = add_gig_features(full_df)
 
+added_time_features = ['hour', 'day', 'week_in_month', 'months_since_reg', 'hour_diff_from_last_purchase', 'days_since_last_purchase', 'is_weekend']
+added_gig_features = ['price_change_from_last_purchase', 'is_same_sc_as_last_purchase', 'position_diff_from_avg']
+categorical_columns.append('continent')
+training_cols = added_time_features + added_gig_features + numeric_columns + categorical_columns
+full_df = full_df[training_cols + ['is_click']]
+
+# this has to come before splitting the data
+# I wanted to be sure that "my" categorical columns are treated as such
+for row in full_df.dtypes.reset_index().iterrows():
+    print(row[1]['index'])
+    if row[1]['index'] in categorical_columns:
+        full_df[row[1]['index']] = full_df[row[1]['index']].astype('category')
+
+    if (row[1][0] == 'object'):
+        full_df[row[1]['index']] = full_df[row[1]['index']].astype('category')
+
 x_train, x_test, y_train, y_test = train_test_split(full_df.drop('is_click', axis=1), full_df['is_click'], test_size=0.2)
 x_train, x_val, y_train, y_val = train_test_split(x_train, y_train, test_size=0.2)
 
-for row in full_df.dtypes.reset_index().iterrows():
-    if (row[1][0] == 'object'):
-        full_df[row[1]['index']] = full_df[row[1]['index']].astype('category')
+# for row in full_df.dtypes.reset_index().iterrows():
+#     if (row[1][0] == 'object'):
+#         full_df[row[1]['index']] = full_df[row[1]['index']].astype('category')
 
 model_params = dict(
     learning_rate=0.2,
@@ -116,6 +146,9 @@ cv_metrics = []
 n_folds = 6
 full_df = full_df.reset_index(drop=True)
 
+# same model for all folds
+model = xgb.XGBClassifier(eval_metric='logloss', enable_categorical=True, **model_params)
+
 splitter = KFold(n_splits=n_folds, shuffle=True, random_state=13)
 for i, (train_indices, test_indices) in enumerate(splitter.split(full_df)):
     print(f'Fold {i}')
@@ -125,8 +158,9 @@ for i, (train_indices, test_indices) in enumerate(splitter.split(full_df)):
     y_test = full_df['is_click'][test_indices].astype(int)
 
     x_train, x_val, y_train, y_val = train_test_split(x_train, y_train, test_size=0.2, stratify=y_train, random_state=13)
-
+    # do not init a new model each time!
     model = xgb.XGBClassifier(eval_metric='logloss', enable_categorical=True, **model_params)
+    # model = xgb.XGBClassifier(eval_metric='logloss', enable_categorical=True, **model_params)
     model.fit(x_train, y_train,
               eval_set=[(x_train, y_train), (x_val, y_val)], verbose=50)
     y_prob = model.predict_proba(x_test)[:, 1]
